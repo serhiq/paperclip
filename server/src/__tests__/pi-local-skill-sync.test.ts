@@ -20,7 +20,7 @@ describe("pi local skill sync", () => {
     cleanupDirs.clear();
   });
 
-  it("reports configured Paperclip skills and installs them into the Pi skills home", async () => {
+  it("reports configured Paperclip skills without installing them into the Pi skills home", async () => {
     const home = await makeTempDir("paperclip-pi-skill-sync-");
     cleanupDirs.add(home);
 
@@ -39,12 +39,15 @@ describe("pi local skill sync", () => {
     } as const;
 
     const before = await listPiSkills(ctx);
-    expect(before.mode).toBe("persistent");
+    expect(before.mode).toBe("ephemeral");
     expect(before.desiredSkills).toContain(paperclipKey);
-    expect(before.entries.find((entry) => entry.key === paperclipKey)?.state).toBe("missing");
+    expect(before.entries.find((entry) => entry.key === paperclipKey)?.state).toBe("configured");
 
     const after = await syncPiSkills(ctx, [paperclipKey]);
-    expect(after.entries.find((entry) => entry.key === paperclipKey)?.state).toBe("installed");
-    expect((await fs.lstat(path.join(home, ".pi", "agent", "skills", "paperclip"))).isSymbolicLink()).toBe(true);
+    expect(after.mode).toBe("ephemeral");
+    expect(after.entries.find((entry) => entry.key === paperclipKey)?.state).toBe("configured");
+    await expect(fs.lstat(path.join(home, ".pi", "agent", "skills", "paperclip"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });

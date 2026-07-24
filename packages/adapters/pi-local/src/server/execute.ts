@@ -32,19 +32,18 @@ import {
   joinPromptSections,
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
-  ensurePaperclipSkillSymlink,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
-  removeMaintainerOnlySkillSymlinks,
   renderTemplate,
   renderPaperclipWakePrompt,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
+  type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
@@ -56,7 +55,6 @@ import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 const PAPERCLIP_SESSIONS_DIR = path.join(os.homedir(), ".pi", "paperclips");
-const PI_AGENT_SKILLS_DIR = path.join(os.homedir(), ".pi", "agent", "skills");
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -81,56 +79,25 @@ function parseModelId(model: string | null): string | null {
   return trimmed.slice(trimmed.indexOf("/") + 1).trim() || null;
 }
 
-async function ensurePiSkillsInjected(
-  onLog: AdapterExecutionContext["onLog"],
-  skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
-  desiredSkillNames?: string[],
-) {
-  const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
-  const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
-  if (selectedEntries.length === 0) return;
-  await fs.mkdir(PI_AGENT_SKILLS_DIR, { recursive: true });
-  const removedSkills = await removeMaintainerOnlySkillSymlinks(
-    PI_AGENT_SKILLS_DIR,
-    selectedEntries.map((entry) => entry.runtimeName),
-  );
-  for (const skillName of removedSkills) {
-    await onLog(
-      "stderr",
-      `[paperclip] Removed maintainer-only Pi skill "${skillName}" from ${PI_AGENT_SKILLS_DIR}\n`,
-    );
-  }
+type PiSkillsDir = {
+  rootDir: string;
+  skillsDir: string;
+};
 
-  for (const entry of selectedEntries) {
-    const target = path.join(PI_AGENT_SKILLS_DIR, entry.runtimeName);
+async function buildPiSkillsDir(selectedEntries: PaperclipSkillEntry[]): Promise<PiSkillsDir> {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-skills-"));
+  const skillsDir = path.join(rootDir, "skills");
 
-    try {
-      const result = await ensurePaperclipSkillSymlink(entry.source, target);
-      if (result === "skipped") continue;
-      await onLog(
-        "stderr",
-        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} Pi skill "${entry.runtimeName}" into ${PI_AGENT_SKILLS_DIR}\n`,
-      );
-    } catch (err) {
-      await onLog(
-        "stderr",
-        `[paperclip] Failed to inject Pi skill "${entry.runtimeName}" into ${PI_AGENT_SKILLS_DIR}: ${err instanceof Error ? err.message : String(err)}\n`,
-      );
+  try {
+    await fs.mkdir(skillsDir, { recursive: true });
+    for (const entry of selectedEntries) {
+      await fs.symlink(entry.source, path.join(skillsDir, entry.runtimeName));
     }
+    return { rootDir, skillsDir };
+  } catch (error) {
+    await fs.rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
-}
-
-async function buildPiSkillsDir(config: Record<string, unknown>): Promise<string> {
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-skills-"));
-  const target = path.join(tmp, "skills");
-  await fs.mkdir(target, { recursive: true });
-  const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
-  for (const entry of availableEntries) {
-    if (!desiredNames.has(entry.key)) continue;
-    await fs.symlink(entry.source, path.join(target, entry.runtimeName));
-  }
-  return target;
 }
 
 function resolvePiBiller(env: Record<string, string>, provider: string | null): string {
@@ -260,8 +227,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const piSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredPiSkillNames = resolvePaperclipDesiredSkillNames(config, piSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensurePiSkillsInjected(onLog, piSkillEntries, desiredPiSkillNames);
+  const desiredPiSkillKeys = new Set(desiredPiSkillNames);
+  const selectedPiSkillEntries: PaperclipSkillEntry[] = [];
+  const selectedPiSkillByRuntimeName = new Map<string, PaperclipSkillEntry>();
+  const skippedPiSkillEntries: Array<{
+    skipped: PaperclipSkillEntry;
+    selected: PaperclipSkillEntry;
+  }> = [];
+  for (const entry of piSkillEntries) {
+    if (!desiredPiSkillKeys.has(entry.key)) continue;
+    const selected = selectedPiSkillByRuntimeName.get(entry.runtimeName);
+    if (selected) {
+      skippedPiSkillEntries.push({ skipped: entry, selected });
+      continue;
+    }
+    selectedPiSkillByRuntimeName.set(entry.runtimeName, entry);
+    selectedPiSkillEntries.push(entry);
   }
 
   // Build environment
@@ -327,16 +308,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (localAgentConfigDir) {
     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
   }
+  let localSkillsRootDir: string | null = null;
   try {
-    // Prepend installed skill `bin/` dirs to PATH so an agent's bash tool can
-    // invoke skill binaries (e.g. `paperclip-get-issue`) by name. Without this,
-    // any pi_local agent whose AGENTS.md calls a skill command via bash hits
-    // exit 127 "command not found". Only include skills that ensurePiSkillsInjected
-    // actually linked — otherwise non-injected skills' binaries would be reachable
-    // to the agent.
-    const injectedSkillKeys = new Set(desiredPiSkillNames);
-    const skillBinDirs = piSkillEntries
-      .filter((entry) => injectedSkillKeys.has(entry.key) && entry.source.length > 0)
+    for (const { skipped, selected } of skippedPiSkillEntries) {
+      await onLog(
+        "stderr",
+        `[paperclip] Skipping Pi skill "${skipped.key}" because runtime name "${skipped.runtimeName}" is already provided by "${selected.key}".\n`,
+      );
+    }
+
+    // Prepend selected skill `bin/` dirs to PATH so an agent's bash tool can
+    // invoke skill binaries (e.g. `paperclip-get-issue`) by name. Derive PATH
+    // additions from the same entries mounted into the run-scoped skills dir.
+    const skillBinDirs = selectedPiSkillEntries
+      .filter((entry) => entry.source.length > 0)
       .map((entry) => path.join(entry.source, "bin"));
     const mergedEnv = ensurePathInEnv({ ...process.env, ...env });
     const pathKey =
@@ -399,13 +384,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     })();
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let remoteRuntimeRootDir: string | null = null;
-    let localSkillsDir: string | null = null;
     let remoteSkillsDir: string | null = null;
     let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
+    const localSkills = await buildPiSkillsDir(selectedPiSkillEntries);
+    localSkillsRootDir = localSkills.rootDir;
+    const localSkillsDir = localSkills.skillsDir;
+    const mountedSkillNames = selectedPiSkillEntries.map((entry) => entry.runtimeName);
+    await onLog(
+      "stderr",
+      `[paperclip] Mounted ${mountedSkillNames.length} run-scoped Pi skill${mountedSkillNames.length === 1 ? "" : "s"}${mountedSkillNames.length > 0 ? `: ${mountedSkillNames.join(", ")}` : ""}.\n`,
+    );
+
     if (executionTargetIsRemote) {
       try {
-        localSkillsDir = await buildPiSkillsDir(config);
         await onLog(
           "stdout",
           `[paperclip] Syncing workspace and Pi runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
@@ -459,10 +451,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           env.PI_CODING_AGENT_DIR = preparedRemoteRuntime.assetDirs.agentConfig;
         }
       } catch (error) {
-        await Promise.allSettled([
-          restoreRemoteWorkspace?.(),
-          localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-        ]);
+        await Promise.allSettled([restoreRemoteWorkspace?.()]);
         throw error;
       }
     }
@@ -645,6 +634,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return notes;
     })();
 
+    const runtimeSkillsDir = executionTargetIsRemote ? remoteSkillsDir : localSkillsDir;
+    if (!runtimeSkillsDir) {
+      throw new Error("Remote Pi runtime did not provide the staged skills directory.");
+    }
+
     const buildArgs = (sessionFile: string): string[] => {
       const args: string[] = [];
 
@@ -661,7 +655,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       args.push("--tools", "read,bash,edit,write,grep,find,ls");
       args.push("--session", sessionFile);
-      args.push("--skill", remoteSkillsDir ?? PI_AGENT_SKILLS_DIR);
+      args.push("--no-skills");
+      args.push("--skill", runtimeSkillsDir);
 
       if (extraArgs.length > 0) args.push(...extraArgs);
 
@@ -852,10 +847,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await Promise.all([
         paperclipBridge?.stop(),
         restoreRemoteWorkspace?.(),
-        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
     }
   } finally {
-    await preparedRuntimeConfig.cleanup();
+    await Promise.all([
+      localSkillsRootDir
+        ? fs.rm(localSkillsRootDir, { recursive: true, force: true }).catch(() => undefined)
+        : Promise.resolve(),
+      preparedRuntimeConfig.cleanup(),
+    ]);
   }
 }
