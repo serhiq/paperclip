@@ -5,7 +5,7 @@ import path from "node:path";
 type PreparedPiRuntimeConfig = {
   env: Record<string, string>;
   notes: string[];
-  /** The managed agent-config dir, or null when no provider config was written. */
+  /** The effective local Pi agent-config dir, persistent or run-scoped. */
   agentConfigDir: string | null;
   cleanup: () => Promise<void>;
 };
@@ -99,35 +99,66 @@ function parseProviderConfig(
 // config (not hard-coded) so the gateway URL, key, and model list stay declarative.
 //
 // When PAPERCLIP_PI_PROVIDERS is set we write {"providers": ...} to a fresh temp
-// dir and point PI_CODING_AGENT_DIR at it; the managed dir intentionally replaces
-// the host agent dir (credentials travel inside the providers config itself, via
-// a literal apiKey or a server-side-expanded {env:VAR} placeholder). For remote
-// execution targets, execute.ts ships the dir to the sandbox as a runtime asset
-// and repoints PI_CODING_AGENT_DIR at the in-sandbox copy.
+// dir and point PI_CODING_AGENT_DIR at it. If a persistent managed profile was
+// prepared for the agent, the run-scoped dir also receives its allowlisted
+// settings and auth link. Provider secrets therefore remain ephemeral while the
+// profile's credentials and trust policy remain effective. For remote execution
+// targets, execute.ts ships the runtime dir to the sandbox and repoints
+// PI_CODING_AGENT_DIR at the in-sandbox copy.
+async function stageManagedProfileBase(
+  baseAgentConfigDir: string,
+  runtimeAgentConfigDir: string,
+): Promise<void> {
+  const settingsSource = path.join(baseAgentConfigDir, "settings.json");
+  try {
+    await fs.copyFile(settingsSource, path.join(runtimeAgentConfigDir, "settings.json"));
+    await fs.chmod(path.join(runtimeAgentConfigDir, "settings.json"), 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const authSource = path.join(baseAgentConfigDir, "auth.json");
+  const resolvedAuthSource = await fs.realpath(authSource).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (resolvedAuthSource) {
+    await fs.symlink(resolvedAuthSource, path.join(runtimeAgentConfigDir, "auth.json"));
+  }
+}
+
 export async function preparePiRuntimeConfig(input: {
   env: Record<string, string>;
+  baseAgentConfigDir?: string | null;
 }): Promise<PreparedPiRuntimeConfig> {
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
   const { providers, warning } = parseProviderConfig(
     input.env.PAPERCLIP_PI_PROVIDERS ?? process.env.PAPERCLIP_PI_PROVIDERS,
     resolveEnv,
   );
+  const baseAgentConfigDir = input.baseAgentConfigDir?.trim() || null;
   if (!providers) {
     return {
-      env: input.env,
+      env: baseAgentConfigDir
+        ? { ...input.env, PI_CODING_AGENT_DIR: baseAgentConfigDir }
+        : input.env,
       notes: warning ? [warning] : [],
-      agentConfigDir: null,
+      agentConfigDir: baseAgentConfigDir,
       cleanup: async () => {},
     };
   }
 
   const agentConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-agent-config-"));
   try {
+    if (baseAgentConfigDir) {
+      await stageManagedProfileBase(baseAgentConfigDir, agentConfigDir);
+    }
     await fs.writeFile(
       path.join(agentConfigDir, "models.json"),
       `${JSON.stringify({ providers }, null, 2)}\n`,
-      "utf8",
+      { encoding: "utf8", mode: 0o600 },
     );
+    await fs.chmod(path.join(agentConfigDir, "models.json"), 0o600);
   } catch (err) {
     // Never leak the temp dir when the write fails (e.g. disk-full): the
     // caller only receives the cleanup handle on success.

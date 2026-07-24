@@ -5,6 +5,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import {
   asString,
+  asBoolean,
   parseObject,
   ensurePathInEnv,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -86,6 +87,19 @@ export async function testEnvironment(
   const command = asString(config.command, "pi");
   const target = ctx.executionTarget ?? null;
   const targetIsRemote = target?.kind === "remote";
+  if (targetIsRemote && asBoolean(config.isolatePiProfile, false)) {
+    return {
+      adapterType: ctx.adapterType,
+      status: "fail",
+      checks: [{
+        code: "pi_managed_profile_remote_unsupported",
+        level: "error",
+        message: "Managed Pi profile isolation currently supports local execution targets only.",
+        hint: "Disable isolatePiProfile for this remote environment.",
+      }],
+      testedAt: new Date().toISOString(),
+    };
+  }
   const cwd = resolveAdapterExecutionTargetCwd(target, asString(config.cwd, ""), process.cwd());
   const targetLabel = targetIsRemote
     ? ctx.environmentName ?? describeAdapterExecutionTarget(target)

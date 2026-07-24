@@ -519,6 +519,8 @@ export interface CreateConfigValues {
   promptTemplate: string;
   model: string;
   thinkingEffort: string;
+  /** Run Pi with a persistent Paperclip-managed profile scoped to this agent. */
+  isolatePiProfile?: boolean;
   /**
    * Optional cheap model profile config for new agents on adapters that
    * support model profiles. Persisted under

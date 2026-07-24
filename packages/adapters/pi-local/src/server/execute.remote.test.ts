@@ -95,6 +95,47 @@ import { execute } from "./execute.js";
 describe("pi remote execution", () => {
   const cleanupDirs: string[] = [];
 
+  it("fails clearly when managed profile isolation is requested for a remote target", async () => {
+    await expect(
+      execute({
+        runId: "run-managed-profile-remote",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Pi Builder",
+          adapterType: "pi_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: "pi",
+          model: "openai/gpt-5.4-mini",
+          isolatePiProfile: true,
+        },
+        context: {},
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow(/supports local execution targets only/);
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
   afterEach(async () => {
     vi.clearAllMocks();
     while (cleanupDirs.length > 0) {

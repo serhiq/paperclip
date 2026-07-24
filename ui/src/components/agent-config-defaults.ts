@@ -7,6 +7,7 @@ export const defaultCreateValues: CreateConfigValues = {
   promptTemplate: "",
   model: "",
   thinkingEffort: "",
+  isolatePiProfile: false,
   chrome: false,
   dangerouslySkipPermissions: true,
   search: false,

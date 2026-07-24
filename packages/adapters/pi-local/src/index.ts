@@ -30,6 +30,7 @@ Core fields:
 - promptTemplate (string, optional): user prompt template passed via -p flag
 - model (string, required): Pi model id in provider/model format (for example xai/grok-4)
 - thinking (string, optional): thinking level (off, minimal, low, medium, high, xhigh)
+- isolatePiProfile (boolean, optional, default false): create a persistent Paperclip-managed PI_CODING_AGENT_DIR scoped to the company and agent. Local execution targets only. The managed profile does not inherit host settings, extensions, MCP config, packages, skills, or sessions. If the host Pi auth.json exists, it is shared through a compatibility symlink; concurrent OAuth refreshes from different agents can race.
 - command (string, optional): defaults to "pi"
 - env (object, optional): KEY=VALUE environment variables
 
@@ -57,8 +58,9 @@ Operational fields:
 Notes:
 - Pi supports multiple providers and models. Use \`pi --list-models\` to list available options.
 - Paperclip requires an explicit \`model\` value for \`pi_local\` agents.
-- Sessions are stored in ~/.pi/paperclips/ and resumed with --session.
+- Sessions are stored in ~/.pi/paperclips/ by default. With isolatePiProfile enabled, new sessions are stored under the managed per-agent profile. Existing absolute session paths continue to resume with --session.
 - Assigned Paperclip skills are loaded from a run-scoped directory; implicit Pi global, project, and settings skill discovery is disabled.
+- With isolatePiProfile enabled, implicit extension discovery is disabled. Explicit extension arguments in extraArgs remain an operator-controlled escape hatch.
 - All tools (read, bash, edit, write, grep, find, ls) are enabled by default.
 - Agent instructions are appended to Pi's system prompt via --append-system-prompt, while the user task is sent via -p.
 `;

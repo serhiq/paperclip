@@ -71,7 +71,14 @@ const capturePath = ${JSON.stringify(capturePath)};
 const previous = fs.existsSync(capturePath)
   ? JSON.parse(fs.readFileSync(capturePath, "utf8"))
   : [];
-previous.push({ args, skillsDir, entries, targets, path: process.env.PATH || "" });
+previous.push({
+  args,
+  skillsDir,
+  entries,
+  targets,
+  path: process.env.PATH || "",
+  piAgentDir: process.env.PI_CODING_AGENT_DIR || null,
+});
 fs.writeFileSync(capturePath, JSON.stringify(previous));
 if (${JSON.stringify(options.unknownSessionOnce === true)} && previous.length === 1) {
   console.error("unknown session id");
@@ -101,23 +108,33 @@ async function executeSkillsFixture(input: {
   skills: RuntimeSkillFixture[];
   desiredSkills: string[];
   runtime?: Parameters<typeof execute>[0]["runtime"];
+  freshSession?: boolean;
+  isolatePiProfile?: boolean;
+  paperclipHome?: string;
   logs?: Array<{ stream: "stdout" | "stderr"; chunk: string }>;
 }) {
   const agentId = `agent-${input.runId}`;
   const testSessionPath = path.join(input.workspace, `.pi-session-${input.runId}.jsonl`);
-  if (!input.runtime) {
+  if (!input.runtime && !input.freshSession) {
     await fs.writeFile(
       testSessionPath,
       `${JSON.stringify({ type: "session", cwd: input.workspace })}\n`,
       "utf8",
     );
   }
-  const runtime = input.runtime ?? {
-    sessionId: testSessionPath,
-    sessionParams: { sessionId: testSessionPath, cwd: input.workspace },
-    sessionDisplayId: testSessionPath,
-    taskKey: null,
-  };
+  const runtime = input.runtime ?? (input.freshSession
+    ? {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      }
+    : {
+        sessionId: testSessionPath,
+        sessionParams: { sessionId: testSessionPath, cwd: input.workspace },
+        sessionDisplayId: testSessionPath,
+        taskKey: null,
+      });
 
   return execute({
     runId: input.runId,
@@ -134,7 +151,11 @@ async function executeSkillsFixture(input: {
       cwd: input.workspace,
       model: "google/gemini-3-flash-preview",
       promptTemplate: "Keep working.",
-      env: { HOME: input.home },
+      env: {
+        HOME: input.home,
+        ...(input.paperclipHome ? { PAPERCLIP_HOME: input.paperclipHome } : {}),
+      },
+      ...(input.isolatePiProfile ? { isolatePiProfile: true } : {}),
       paperclipRuntimeSkills: input.skills,
       paperclipSkillSync: { desiredSkills: input.desiredSkills },
     },
@@ -147,6 +168,72 @@ async function executeSkillsFixture(input: {
 }
 
 describe("pi_local execute", () => {
+  it("uses a persistent per-agent Pi profile with shared auth and isolated sessions", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-profile-execute-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "pi");
+    const capturePath = path.join(root, "capture.json");
+    const hostAgentDir = path.join(root, ".pi", "agent");
+    const hostAuthPath = path.join(hostAgentDir, "auth.json");
+    const paperclipHome = path.join(root, "paperclip-home");
+    await Promise.all([
+      fs.mkdir(workspace, { recursive: true }),
+      fs.mkdir(path.join(hostAgentDir, "extensions", "host-only"), { recursive: true }),
+    ]);
+    await Promise.all([
+      fs.writeFile(hostAuthPath, '{"openai-codex":{"type":"oauth"}}\n', "utf8"),
+      fs.writeFile(path.join(hostAgentDir, "settings.json"), '{"packages":["host-only"]}\n', "utf8"),
+      writeSkillsInspectingPiCommand(commandPath, capturePath),
+    ]);
+
+    try {
+      const result = await executeSkillsFixture({
+        runId: "profile-isolation",
+        commandPath,
+        workspace,
+        home: root,
+        paperclipHome,
+        skills: [],
+        desiredSkills: [],
+        freshSession: true,
+        isolatePiProfile: true,
+      });
+
+      const managedAgentDir = path.join(
+        paperclipHome,
+        "instances",
+        "default",
+        "companies",
+        "company-skills-isolation",
+        "agents",
+        "agent-profile-isolation",
+        "pi-agent",
+      );
+      const captures = JSON.parse(await fs.readFile(capturePath, "utf8")) as Array<{
+        args: string[];
+        piAgentDir: string | null;
+      }>;
+      expect(captures).toHaveLength(1);
+      expect(captures[0]?.piAgentDir).toBe(managedAgentDir);
+      expect(captures[0]?.args).toContain("--no-extensions");
+      expect(String(result.sessionId).startsWith(path.join(managedAgentDir, "sessions", "paperclip") + path.sep)).toBe(true);
+      expect(await fs.realpath(path.join(managedAgentDir, "auth.json"))).toBe(
+        await fs.realpath(hostAuthPath),
+      );
+      expect(JSON.parse(await fs.readFile(path.join(managedAgentDir, "settings.json"), "utf8"))).toEqual({
+        defaultProjectTrust: "never",
+      });
+      expect(await fs.readFile(path.join(hostAgentDir, "settings.json"), "utf8")).toBe(
+        '{"packages":["host-only"]}\n',
+      );
+      await expect(fs.access(path.join(managedAgentDir, "extensions"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("loads only selected skills from a run-scoped directory without changing the host skills home", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-skills-isolation-"));
     const workspace = path.join(root, "workspace");

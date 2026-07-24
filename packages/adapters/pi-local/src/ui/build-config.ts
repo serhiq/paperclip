@@ -49,6 +49,7 @@ export function buildPiLocalConfig(v: CreateConfigValues): Record<string, unknow
   if (v.instructionsFilePath) ac.instructionsFilePath = v.instructionsFilePath;
   if (v.model) ac.model = v.model;
   if (v.thinkingEffort) ac.thinking = v.thinkingEffort;
+  if (v.isolatePiProfile) ac.isolatePiProfile = true;
   
   // Pi sessions can run until the CLI exits naturally; keep timeout disabled (0)
   ac.timeoutSec = 0;

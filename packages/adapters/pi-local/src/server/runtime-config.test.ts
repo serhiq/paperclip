@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
@@ -22,6 +23,89 @@ async function readModelsJson(agentConfigDir: string): Promise<Record<string, un
 }
 
 describe("preparePiRuntimeConfig", () => {
+  it("uses a managed base profile without making it ephemeral when providers are unset", async () => {
+    const baseAgentConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-managed-base-"));
+    cleanupPaths.add(baseAgentConfigDir);
+    await fs.writeFile(
+      path.join(baseAgentConfigDir, "settings.json"),
+      '{"defaultProjectTrust":"never"}\n',
+      "utf8",
+    );
+
+    const prepared = await preparePiRuntimeConfig({
+      env: { FOO: "bar" },
+      baseAgentConfigDir,
+    });
+
+    expect(prepared.env).toEqual({
+      FOO: "bar",
+      PI_CODING_AGENT_DIR: baseAgentConfigDir,
+    });
+    expect(prepared.agentConfigDir).toBe(baseAgentConfigDir);
+    await prepared.cleanup();
+    await expect(fs.access(baseAgentConfigDir)).resolves.toBeUndefined();
+  });
+
+  it("composes run-scoped providers with the managed profile without persisting provider secrets", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-managed-overlay-"));
+    cleanupPaths.add(root);
+    const baseAgentConfigDir = path.join(root, "base");
+    const sharedAuthPath = path.join(root, "shared-auth.json");
+    await fs.mkdir(baseAgentConfigDir, { recursive: true });
+    await fs.writeFile(sharedAuthPath, '{"openai-codex":{"type":"oauth"}}\n', "utf8");
+    await fs.symlink(sharedAuthPath, path.join(baseAgentConfigDir, "auth.json"));
+    await fs.writeFile(
+      path.join(baseAgentConfigDir, "settings.json"),
+      '{"defaultProjectTrust":"never"}\n',
+      "utf8",
+    );
+    const providers = {
+      tensorix: {
+        baseUrl: "http://gw/anthropic",
+        apiKey: "{env:PI_PROFILE_TEST_KEY}",
+        api: "anthropic-messages",
+        models: [],
+      },
+    };
+
+    const prepared = await preparePiRuntimeConfig({
+      env: {
+        PAPERCLIP_PI_PROVIDERS: JSON.stringify(providers),
+        PI_PROFILE_TEST_KEY: "secret-that-must-stay-ephemeral",
+      },
+      baseAgentConfigDir,
+    });
+    const runtimeAgentDir = prepared.agentConfigDir;
+    expect(runtimeAgentDir).toBeTruthy();
+    expect(runtimeAgentDir).not.toBe(baseAgentConfigDir);
+    cleanupPaths.add(runtimeAgentDir!);
+
+    expect(await readModelsJson(runtimeAgentDir!)).toEqual({
+      providers: {
+        tensorix: {
+          baseUrl: "http://gw/anthropic",
+          apiKey: "secret-that-must-stay-ephemeral",
+          api: "anthropic-messages",
+          models: [],
+        },
+      },
+    });
+    expect(JSON.parse(await fs.readFile(path.join(runtimeAgentDir!, "settings.json"), "utf8"))).toEqual({
+      defaultProjectTrust: "never",
+    });
+    expect(await fs.realpath(path.join(runtimeAgentDir!, "auth.json"))).toBe(
+      await fs.realpath(sharedAuthPath),
+    );
+    await expect(fs.access(path.join(baseAgentConfigDir, "models.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    await prepared.cleanup();
+    cleanupPaths.delete(runtimeAgentDir!);
+    await expect(fs.access(runtimeAgentDir!)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(baseAgentConfigDir)).resolves.toBeUndefined();
+  });
+
   it("is a no-op when PAPERCLIP_PI_PROVIDERS is unset", async () => {
     const prepared = await preparePiRuntimeConfig({ env: { FOO: "bar" } });
 

@@ -26,6 +26,7 @@ import {
 import {
   asString,
   asNumber,
+  asBoolean,
   asStringArray,
   parseObject,
   buildPaperclipEnv,
@@ -49,6 +50,7 @@ import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
+import { prepareManagedPiProfile } from "./pi-profile.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -104,14 +106,14 @@ function resolvePiBiller(env: Record<string, string>, provider: string | null): 
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
-async function ensureSessionsDir(): Promise<string> {
-  await fs.mkdir(PAPERCLIP_SESSIONS_DIR, { recursive: true });
-  return PAPERCLIP_SESSIONS_DIR;
+async function ensureSessionsDir(sessionsDir: string): Promise<string> {
+  await fs.mkdir(sessionsDir, { recursive: true });
+  return sessionsDir;
 }
 
-function buildSessionPath(agentId: string, timestamp: string): string {
+function buildSessionPath(sessionsDir: string, agentId: string, timestamp: string): string {
   const safeTimestamp = timestamp.replace(/[:.]/g, "-");
-  return path.join(PAPERCLIP_SESSIONS_DIR, `${safeTimestamp}-${agentId}.jsonl`);
+  return path.join(sessionsDir, `${safeTimestamp}-${agentId}.jsonl`);
 }
 
 function buildRemoteSessionPath(runtimeRootDir: string, agentId: string, timestamp: string): string {
@@ -188,6 +190,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
+  const isolatePiProfile = asBoolean(config.isolatePiProfile, false);
+  if (isolatePiProfile && executionTargetIsRemote) {
+    throw new Error(
+      "Managed Pi profile isolation currently supports local execution targets only; disable isolatePiProfile for this remote environment.",
+    );
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
@@ -220,10 +228,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
-
-  if (!executionTargetIsRemote) {
-    await ensureSessionsDir();
-  }
 
   const piSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredPiSkillNames = resolvePaperclipDesiredSkillNames(config, piSkillEntries);
@@ -300,10 +304,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  // Materialize custom Pi providers (PAPERCLIP_PI_PROVIDERS) into a managed
-  // PI_CODING_AGENT_DIR before runtimeEnv is computed, so both local validation
-  // and the spawned Pi process resolve models against the managed models.json.
-  const preparedRuntimeConfig = await preparePiRuntimeConfig({ env });
+  // A managed profile starts empty except for its own trust policy, sessions,
+  // and the explicitly selected shared-auth compatibility symlink. Runtime
+  // provider configuration is composed on top without persisting provider
+  // secrets into the profile.
+  const preparedManagedProfile = isolatePiProfile
+    ? await prepareManagedPiProfile({
+        env,
+        companyId: agent.companyId,
+        agentId: agent.id,
+      })
+    : null;
+  const localSessionsDir = preparedManagedProfile?.sessionsDir ?? PAPERCLIP_SESSIONS_DIR;
+  if (!executionTargetIsRemote) {
+    await ensureSessionsDir(localSessionsDir);
+  }
+  const preparedRuntimeConfig = await preparePiRuntimeConfig({
+    env,
+    baseAgentConfigDir: preparedManagedProfile?.agentDir,
+  });
   const localAgentConfigDir = preparedRuntimeConfig.agentConfigDir ?? "";
   if (localAgentConfigDir) {
     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
@@ -364,7 +383,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
     let loggedEnv = buildInvocationEnvForLogs(env, {
       runtimeEnv,
-      includeRuntimeKeys: ["HOME"],
+      includeRuntimeKeys: ["HOME", "PI_CODING_AGENT_DIR"],
       resolvedCommand,
     });
 
@@ -474,7 +493,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               (entry): entry is [string, string] => typeof entry[1] === "string",
             ),
           ),
-          includeRuntimeKeys: ["HOME"],
+          includeRuntimeKeys: ["HOME", "PI_CODING_AGENT_DIR"],
           resolvedCommand,
         });
       }
@@ -513,7 +532,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeSessionId
       : executionTargetIsRemote && remoteRuntimeRootDir
         ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-        : buildSessionPath(agent.id, new Date().toISOString());
+        : buildSessionPath(localSessionsDir, agent.id, new Date().toISOString());
 
     if (runtimeSessionId && !canResumeSession) {
       const staleSessionCwdNote =
@@ -616,7 +635,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     const commandNotes = (() => {
-      const notes = [...preparedRuntimeConfig.notes];
+      const notes = [
+        ...(preparedManagedProfile?.notes ?? []),
+        ...preparedRuntimeConfig.notes,
+      ];
       if (stdoutLogMode !== "raw") {
         notes.push(`Pi stdout run-log compaction mode: ${stdoutLogMode}`);
       }
@@ -657,6 +679,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--session", sessionFile);
       args.push("--no-skills");
       args.push("--skill", runtimeSkillsDir);
+      if (isolatePiProfile) args.push("--no-extensions");
 
       if (extraArgs.length > 0) args.push(...extraArgs);
 
@@ -820,7 +843,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
           ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-          : buildSessionPath(agent.id, new Date().toISOString());
+          : buildSessionPath(localSessionsDir, agent.id, new Date().toISOString());
         if (executionTargetIsRemote) {
           await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
             cwd,

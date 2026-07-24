@@ -39,6 +39,33 @@ process.exit(1);
 }
 
 describe("pi_local environment diagnostics", () => {
+  it("rejects managed Pi profiles for remote environment probes", async () => {
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "pi_local",
+      config: {
+        model: "openai/gpt-4.1-mini",
+        isolatePiProfile: true,
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/remote/workspace",
+        spec: {
+          host: "127.0.0.1",
+          port: 22,
+          username: "fixture",
+        },
+      },
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      code: "pi_managed_profile_remote_unsupported",
+      level: "error",
+    }));
+  });
+
   it("passes a hello probe when model discovery and execution succeed", async () => {
     const root = path.join(
       os.tmpdir(),
