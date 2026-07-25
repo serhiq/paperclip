@@ -40,7 +40,6 @@ import {
   resolvePaperclipDesiredSkillNames,
   renderTemplate,
   renderPaperclipWakePrompt,
-  isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   runChildProcess,
@@ -614,10 +613,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: canResumeSession });
-    const shouldUseResumeDeltaPrompt = canResumeSession && wakePrompt.length > 0;
-    const renderedHeartbeatPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
+    // D1 (agent-context audit): the execution-contract template is already
+    // delivered to the model via --append-system-prompt (renderedSystemPromptExtension),
+    // so it is cached as a stable prefix. Do NOT duplicate it in the per-run
+    // user prompt; the user prompt carries only the per-run delta
+    // (bootstrap/wake/handoff). Previously this rendered the full template again
+    // on fresh and scheduler runs (~1.4k tokens duplicated every run).
+    const renderedHeartbeatPrompt = "";
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const userPrompt = joinPromptSections([
       renderedBootstrapPrompt,
