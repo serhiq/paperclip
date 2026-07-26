@@ -25,6 +25,9 @@ const instanceGeneralSettingsStorageSchema = instanceGeneralSettingsSchema.strip
 const instanceExperimentalSettingsStorageSchema = instanceExperimentalSettingsSchema.strip();
 const TRUTHY_RUNTIME_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type InstanceSettingsDb = Pick<Db | DbTransaction, "select" | "insert" | "update">;
+
 interface InstanceSettingsServiceOptions {
   runtimeEnv?: Record<string, string | undefined>;
   now?: () => Date;
@@ -301,7 +304,7 @@ export function applyManagedExperimentalOverlay(
   return { experimental: next, managedKeys };
 }
 
-export function instanceSettingsService(db: Db, options: InstanceSettingsServiceOptions = {}) {
+export function instanceSettingsService(db: InstanceSettingsDb, options: InstanceSettingsServiceOptions = {}) {
   // Fail closed: a malformed PAPERCLIP_MANAGED_CONFIG throws here (and at
   // boot in index.ts) rather than silently running without the overlay.
   const managedConfig = getManagedInstanceConfig(options.runtimeEnv ?? process.env);

@@ -3,6 +3,7 @@ import { MAX_ISSUE_REQUEST_DEPTH } from "../index.js";
 import {
   addIssueCommentSchema,
   createIssueSchema,
+  deleteIssueQuerySchema,
   issueBlockedInboxAttentionSchema,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
@@ -13,6 +14,15 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("parses only exact boolean strings for destructive issue cascade intent", () => {
+    expect(deleteIssueQuerySchema.parse({})).toEqual({ cascade: false });
+    expect(deleteIssueQuerySchema.parse({ cascade: "false" })).toEqual({ cascade: false });
+    expect(deleteIssueQuerySchema.parse({ cascade: "true" })).toEqual({ cascade: true });
+    expect(deleteIssueQuerySchema.safeParse({ cascade: "1" }).success).toBe(false);
+    expect(deleteIssueQuerySchema.safeParse({ cascade: "treu" }).success).toBe(false);
+    expect(deleteIssueQuerySchema.safeParse({ cascade: ["true", "false"] }).success).toBe(false);
+  });
+
   it("passes real line breaks through unchanged", () => {
     const parsed = createIssueSchema.parse({
       title: "Follow up PR",

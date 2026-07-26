@@ -72,6 +72,8 @@ const ACTION_TIER: Record<string, EventTier> = {
   "issue.document_deleted": 3,
   "issue.document_updated": 2,
   "issue.deleted": 3,
+  "issue.subtree_deleted": 3,
+  "issue.subtree_storage_cleanup_completed": 3,
   "issue.feedback_vote_saved": 3,
   "agent.key_created": 3,
   "agent.budget_updated": 3,

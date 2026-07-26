@@ -11,8 +11,11 @@ import {
   assets,
   companies,
   companyMemberships,
+  companySkillTestRuns,
+  costEvents,
   documentRevisions,
   documents,
+  financeEvents,
   goals,
   heartbeatRuns,
   routineRuns,
@@ -139,6 +142,8 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS = ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
+const ISSUE_DELETE_AUDIT_SNAPSHOT_LIMIT = 50;
+const ISSUE_DELETE_AUDIT_TITLE_MAX_CHARS = 500;
 const DELETED_ISSUE_COMMENT_BODY = "";
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
 
@@ -149,6 +154,22 @@ function wakeRequestTargetsIssue(issueId: string) {
     or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${issueId}
     or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${issueId}
   )`;
+}
+
+function postgresErrorMetadata(error: unknown): { code: string | null; constraint: string | null } {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+    const code = "code" in current && typeof current.code === "string" ? current.code : null;
+    const constraint =
+      "constraint" in current && typeof current.constraint === "string"
+        ? current.constraint
+        : "constraint_name" in current && typeof current.constraint_name === "string"
+          ? current.constraint_name
+          : null;
+    if (code || constraint) return { code, constraint };
+    current = "cause" in current ? current.cause : null;
+  }
+  return { code: null, constraint: null };
 }
 
 function wakeDiagnosticActivityTargetsIssue(issueId: string) {
@@ -592,8 +613,20 @@ type IssueUserContextInput = {
   createdAt: Date | string;
   updatedAt: Date | string;
 };
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+type IssueDeleteOptions = {
+  cascade?: boolean;
+  afterDelete?: (
+    deletion: {
+      issue: { id: string; companyId: string };
+      audit: Record<string, unknown>;
+      storageObjectCount: number;
+    },
+    tx: DbTransaction,
+  ) => Promise<void>;
+};
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -6864,39 +6897,290 @@ export function issueService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
-        const attachmentAssetIds = await tx
-          .select({ assetId: issueAttachments.assetId })
-          .from(issueAttachments)
-          .where(eq(issueAttachments.issueId, id));
-        const issueDocumentIds = await tx
-          .select({ documentId: issueDocuments.documentId })
-          .from(issueDocuments)
-          .where(eq(issueDocuments.issueId, id));
+    remove: async (id: string, options: IssueDeleteOptions = {}) => {
+      try {
+        return await db.transaction(async (tx) => {
+          const rootIssue = await tx
+            .select()
+            .from(issues)
+            .where(eq(issues.id, id))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (!rootIssue) return null;
 
-        const removedIssue = await tx
-          .delete(issues)
-          .where(eq(issues.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+          const treeIssues: Array<typeof issues.$inferSelect & { depth: number }> = [
+            { ...rootIssue, depth: 0 },
+          ];
+          const visitedIssueIds = new Set([rootIssue.id]);
+          let frontier = [{ id: rootIssue.id, depth: 0 }];
 
-        if (removedIssue && attachmentAssetIds.length > 0) {
-          await tx
-            .delete(assets)
-            .where(inArray(assets.id, attachmentAssetIds.map((row) => row.assetId)));
+          while (frontier.length > 0) {
+            const parentIds = frontier.map((item) => item.id);
+            const depthByParentId = new Map(frontier.map((item) => [item.id, item.depth]));
+            const children = await tx
+              .select()
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.companyId, rootIssue.companyId),
+                  inArray(issues.parentId, parentIds),
+                ),
+              )
+              .orderBy(asc(issues.id))
+              .for("update");
+
+            const nextFrontier: typeof frontier = [];
+            for (const child of children) {
+              if (visitedIssueIds.has(child.id)) continue;
+              const depth = (depthByParentId.get(child.parentId ?? "") ?? 0) + 1;
+              visitedIssueIds.add(child.id);
+              treeIssues.push({ ...child, depth });
+              nextFrontier.push({ id: child.id, depth });
+            }
+            frontier = nextFrontier;
+          }
+
+          if (!options.cascade && treeIssues.length > 1) {
+            throw conflict("Issue has child issues", {
+              code: "issue_has_children",
+              issueId: rootIssue.id,
+              childCount: treeIssues.length - 1,
+              remediation: "Retry with cascade=true to delete the full subtree",
+            });
+          }
+
+          const issueIds = treeIssues.map((issue) => issue.id);
+          const issueIdFromRunContext = sql<string | null>`coalesce(
+            ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+            ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+          )`;
+          const activeRunIdsOnIssues = treeIssues
+            .flatMap((issue) => [issue.executionRunId, issue.checkoutRunId])
+            .filter((runId): runId is string => typeof runId === "string");
+          const activeRuns = await tx
+            .select({
+              id: heartbeatRuns.id,
+              status: heartbeatRuns.status,
+              contextIssueId: issueIdFromRunContext,
+            })
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.companyId, rootIssue.companyId),
+                inArray(heartbeatRuns.status, ["queued", "running"]),
+                activeRunIdsOnIssues.length > 0
+                  ? or(
+                      inArray(heartbeatRuns.id, [...new Set(activeRunIdsOnIssues)]),
+                      inArray(issueIdFromRunContext, issueIds),
+                    )
+                  : inArray(issueIdFromRunContext, issueIds),
+              ),
+            );
+
+          const wakeIssueId = sql<string | null>`coalesce(
+            ${agentWakeupRequests.payload} ->> 'issueId',
+            ${agentWakeupRequests.payload} ->> 'taskId',
+            ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId',
+            ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId'
+          )`;
+          const activeWakeups = await tx
+            .select({
+              id: agentWakeupRequests.id,
+              status: agentWakeupRequests.status,
+              issueId: wakeIssueId,
+            })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, rootIssue.companyId),
+                inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+                isNull(agentWakeupRequests.runId),
+                inArray(wakeIssueId, issueIds),
+              ),
+            );
+          const inProgressIssueIds = treeIssues
+            .filter((issue) => issue.status === "in_progress")
+            .map((issue) => issue.id);
+
+          if (activeRuns.length > 0 || activeWakeups.length > 0 || inProgressIssueIds.length > 0) {
+            throw conflict("Issue subtree has active work", {
+              code: "issue_delete_active_work",
+              issueId: rootIssue.id,
+              activeRunIds: activeRuns.map((run) => run.id),
+              activeWakeupRequestIds: activeWakeups.map((wakeup) => wakeup.id),
+              inProgressIssueIds,
+              remediation: "Cancel the issue tree, wait for active runs and wakeups to stop, then retry deletion",
+            });
+          }
+
+          const protectedSkillRuns = await tx
+            .select({ id: companySkillTestRuns.id, issueId: companySkillTestRuns.issueId })
+            .from(companySkillTestRuns)
+            .where(
+              and(
+                eq(companySkillTestRuns.companyId, rootIssue.companyId),
+                inArray(companySkillTestRuns.issueId, issueIds),
+              ),
+            );
+          if (protectedSkillRuns.length > 0) {
+            throw conflict("Issue subtree is referenced by protected skill test history", {
+              code: "issue_delete_protected_history",
+              issueId: rootIssue.id,
+              resourceType: "company_skill_test_runs",
+              referenceCount: protectedSkillRuns.length,
+              referencedIssueIds: [...new Set(protectedSkillRuns.map((run) => run.issueId))],
+            });
+          }
+
+          const [attachmentRows, issueDocumentRows, costSummaryRows, financeSummaryRows] = await Promise.all([
+            tx
+              .select({
+                id: issueAttachments.id,
+                assetId: assets.id,
+                companyId: assets.companyId,
+                objectKey: assets.objectKey,
+              })
+              .from(issueAttachments)
+              .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
+              .where(
+                and(
+                  eq(issueAttachments.companyId, rootIssue.companyId),
+                  inArray(issueAttachments.issueId, issueIds),
+                ),
+              ),
+            tx
+              .select({ documentId: issueDocuments.documentId })
+              .from(issueDocuments)
+              .where(
+                and(
+                  eq(issueDocuments.companyId, rootIssue.companyId),
+                  inArray(issueDocuments.issueId, issueIds),
+                ),
+              ),
+            tx
+              .select({
+                count: sql<number>`count(*)`,
+                amountCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)`,
+              })
+              .from(costEvents)
+              .where(
+                and(
+                  eq(costEvents.companyId, rootIssue.companyId),
+                  inArray(costEvents.issueId, issueIds),
+                ),
+              ),
+            tx
+              .select({
+                count: sql<number>`count(*)`,
+                amountCents: sql<number>`coalesce(sum(${financeEvents.amountCents}), 0)`,
+              })
+              .from(financeEvents)
+              .where(
+                and(
+                  eq(financeEvents.companyId, rootIssue.companyId),
+                  inArray(financeEvents.issueId, issueIds),
+                ),
+              ),
+          ]);
+
+          const [removedIssue] = await withIssueLabels(tx, [rootIssue]);
+          const depthsDescending = [...new Set(treeIssues.map((issue) => issue.depth))].sort((left, right) => right - left);
+          for (const depth of depthsDescending) {
+            const issueIdsAtDepth = treeIssues
+              .filter((issue) => issue.depth === depth)
+              .map((issue) => issue.id);
+            await tx
+              .delete(issues)
+              .where(
+                and(
+                  eq(issues.companyId, rootIssue.companyId),
+                  inArray(issues.id, issueIdsAtDepth),
+                ),
+              );
+          }
+
+          if (attachmentRows.length > 0) {
+            await tx.delete(assets).where(inArray(assets.id, attachmentRows.map((row) => row.assetId)));
+          }
+          if (issueDocumentRows.length > 0) {
+            await tx
+              .delete(documents)
+              .where(inArray(documents.id, issueDocumentRows.map((row) => row.documentId)));
+          }
+
+          const issueSnapshot = treeIssues
+            .slice()
+            .sort((left, right) => left.depth - right.depth || left.id.localeCompare(right.id))
+            .slice(0, ISSUE_DELETE_AUDIT_SNAPSHOT_LIMIT)
+            .map((issue) => {
+              const title = truncateByCodePoint(issue.title, ISSUE_DELETE_AUDIT_TITLE_MAX_CHARS);
+              return {
+                id: issue.id,
+                identifier: issue.identifier,
+                title,
+                titleTruncated: title !== issue.title,
+                parentId: issue.parentId,
+                status: issue.status,
+                depth: issue.depth,
+              };
+            });
+
+          const attachments = attachmentRows.map(({ id: attachmentId, companyId, objectKey }) => ({
+            id: attachmentId,
+            companyId,
+            objectKey,
+          }));
+          const audit = {
+            rootIssue: {
+              id: rootIssue.id,
+              identifier: rootIssue.identifier,
+              title: rootIssue.title,
+            },
+            deletedIssueCount: treeIssues.length,
+            deletedIssues: issueSnapshot,
+            deletedIssuesTruncated: treeIssues.length > issueSnapshot.length,
+            costEventCount: Number(costSummaryRows[0]?.count ?? 0),
+            costCents: Number(costSummaryRows[0]?.amountCents ?? 0),
+            financeEventCount: Number(financeSummaryRows[0]?.count ?? 0),
+            financeAmountCents: Number(financeSummaryRows[0]?.amountCents ?? 0),
+            dependencyCounts: {
+              activeRuns: 0,
+              activeWakeups: 0,
+              inProgressIssues: 0,
+              protectedSkillTestRuns: 0,
+            },
+          };
+          const deletion = {
+            issue: removedIssue,
+            attachments,
+            audit,
+          };
+          await options.afterDelete?.({
+            issue: {
+              id: removedIssue.id,
+              companyId: removedIssue.companyId,
+            },
+            audit,
+            storageObjectCount: attachments.length,
+          }, tx);
+          return deletion;
+        });
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        const postgresError = postgresErrorMetadata(error);
+        if (
+          postgresError.code === "23503" &&
+          postgresError.constraint === "issues_parent_id_issues_id_fk"
+        ) {
+          throw conflict("Issue tree changed during deletion", {
+            code: "issue_tree_changed",
+            issueId: id,
+            remediation: "Refresh the issue tree and retry deletion",
+          });
         }
-
-        if (removedIssue && issueDocumentIds.length > 0) {
-          await tx
-            .delete(documents)
-            .where(inArray(documents.id, issueDocumentIds.map((row) => row.documentId)));
-        }
-
-        if (!removedIssue) return null;
-        const [enriched] = await withIssueLabels(tx, [removedIssue]);
-        return enriched;
-      }),
+        throw error;
+      }
+    },
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db

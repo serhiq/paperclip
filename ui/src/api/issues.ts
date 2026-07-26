@@ -208,7 +208,10 @@ export const issuesApi = {
   checkMonitorNow: (id: string) => api.post<{ ok: true }>(`/issues/${id}/monitor/check-now`, {}),
   retryScheduledRetryNow: (id: string) =>
     api.post<IssueRetryNowResponse>(`/issues/${id}/scheduled-retry/retry-now`, {}),
-  remove: (id: string) => api.delete<Issue>(`/issues/${id}`),
+  remove: (id: string, options?: { cascade?: boolean }) => {
+    const query = options?.cascade === undefined ? "" : `?cascade=${options.cascade}`;
+    return api.delete<Issue>(`/issues/${id}${query}`);
+  },
   checkout: (id: string, agentId: string) =>
     api.post<Issue>(`/issues/${id}/checkout`, {
       agentId,

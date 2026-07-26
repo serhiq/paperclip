@@ -10,6 +10,39 @@ const peerAgentId = "44444444-4444-4444-8444-444444444444";
 const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 
+type MockIssueDeletion = {
+  issue: { id: string; companyId: string } & Record<string, unknown>;
+  attachments: Array<{ id: string; companyId: string; objectKey: string }>;
+  audit: Record<string, unknown>;
+};
+
+type MockIssueDeleteOptions = {
+  cascade?: boolean;
+  afterDelete?: (
+    deletion: {
+      issue: { id: string; companyId: string };
+      audit: Record<string, unknown>;
+      storageObjectCount: number;
+    },
+    tx: Record<string, never>,
+  ) => Promise<void>;
+};
+
+async function completeMockIssueDeletion(
+  deletion: MockIssueDeletion,
+  options: MockIssueDeleteOptions,
+) {
+  await options.afterDelete?.({
+    issue: {
+      id: deletion.issue.id,
+      companyId: deletion.issue.companyId,
+    },
+    audit: deletion.audit,
+    storageObjectCount: deletion.attachments.length,
+  }, {});
+  return deletion;
+}
+
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
@@ -617,7 +650,34 @@ describe("agent issue mutation checkout ownership", () => {
         body: "Mentioned reply context.",
       },
     ]);
-    mockIssueService.remove.mockResolvedValue(makeIssue({ status: "cancelled" }));
+    const deletion = {
+      issue: makeIssue({ status: "cancelled" }),
+      attachments: [],
+      audit: {
+        rootIssue: {
+          id: issueId,
+          identifier: "PAP-1649",
+          title: "Owned active issue",
+        },
+        deletedIssueCount: 1,
+        deletedIssues: [],
+        deletedIssuesTruncated: false,
+        costEventCount: 0,
+        costCents: 0,
+        financeEventCount: 0,
+        financeAmountCents: 0,
+        dependencyCounts: {
+          activeRuns: 0,
+          activeWakeups: 0,
+          inProgressIssues: 0,
+          protectedSkillTestRuns: 0,
+        },
+      },
+    } satisfies MockIssueDeletion;
+    mockIssueService.remove.mockImplementation(
+      async (_id: string, options: MockIssueDeleteOptions) =>
+        completeMockIssueDeletion(deletion, options),
+    );
     mockIssueService.getAttachmentById.mockResolvedValue({
       id: "attachment-1",
       issueId,
@@ -738,7 +798,6 @@ describe("agent issue mutation checkout ownership", () => {
 
   it.each([
     ["patch", (app: express.Express) => request(app).patch(`/api/issues/${issueId}`).send({ title: "Blocked" })],
-    ["delete", (app: express.Express) => request(app).delete(`/api/issues/${issueId}`)],
     [
       "document upsert",
       (app: express.Express) =>
@@ -776,6 +835,138 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects issue deletion by agents before reading or mutating the issue", async () => {
+    const res = await request(await createApp(ownerActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Board access required");
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it("passes explicit cascade intent and keeps the successful response as the deleted issue", async () => {
+    const res = await request(await createApp(boardActor()))
+      .delete(`/api/issues/${issueId}`)
+      .query({ cascade: "true" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ id: issueId, status: "cancelled" });
+    expect(res.body).not.toHaveProperty("audit");
+    expect(mockIssueService.remove).toHaveBeenCalledWith(issueId, expect.objectContaining({
+      cascade: true,
+      afterDelete: expect.any(Function),
+    }));
+    expect(mockLogActivity).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity).toHaveBeenNthCalledWith(1, expect.anything(), expect.objectContaining({
+      action: "issue.subtree_deleted",
+      details: expect.objectContaining({
+        cascade: true,
+        storageCleanupStatus: "pending",
+      }),
+    }));
+    const firstDetails = mockLogActivity.mock.calls[0]?.[1]?.details;
+    const secondDetails = mockLogActivity.mock.calls[1]?.[1]?.details;
+    expect(secondDetails).toMatchObject({
+      deletionOperationId: firstDetails?.deletionOperationId,
+      attempted: 0,
+      succeeded: 0,
+      failed: 0,
+    });
+  });
+
+  it("attempts every subtree object cleanup and audits partial failures", async () => {
+    const deletion = {
+      issue: makeIssue({ status: "cancelled" }),
+      attachments: [
+        { id: "attachment-1", companyId, objectKey: "issues/attachment-1/report.txt" },
+        { id: "attachment-2", companyId, objectKey: "issues/attachment-2/report.txt" },
+      ],
+      audit: {
+        rootIssue: { id: issueId, identifier: "PAP-1649", title: "Owned active issue" },
+        deletedIssueCount: 1,
+        deletedIssues: [],
+        deletedIssuesTruncated: false,
+        costEventCount: 0,
+        costCents: 0,
+        financeEventCount: 0,
+        financeAmountCents: 0,
+        dependencyCounts: {
+          activeRuns: 0,
+          activeWakeups: 0,
+          inProgressIssues: 0,
+          protectedSkillTestRuns: 0,
+        },
+      },
+    } satisfies MockIssueDeletion;
+    mockIssueService.remove.mockImplementationOnce(
+      async (_id: string, options: MockIssueDeleteOptions) =>
+        completeMockIssueDeletion(deletion, options),
+    );
+    mockStorageService.deleteObject
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("storage unavailable"));
+
+    const res = await request(await createApp(boardActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockStorageService.deleteObject).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity).toHaveBeenNthCalledWith(2, expect.anything(), expect.objectContaining({
+      action: "issue.subtree_storage_cleanup_completed",
+      details: expect.objectContaining({
+        attempted: 2,
+        succeeded: 1,
+        failed: 1,
+      }),
+    }));
+  });
+
+  it("stops before storage cleanup when the transactional deletion audit fails", async () => {
+    mockLogActivity.mockRejectedValueOnce(new Error("activity unavailable"));
+
+    const res = await request(await createApp(boardActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(500);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  it("keeps the successful response when the post-commit storage audit fails", async () => {
+    mockLogActivity
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("activity unavailable"));
+
+    const res = await request(await createApp(boardActor())).delete(`/api/issues/${issueId}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body).toMatchObject({ id: issueId, status: "cancelled" });
+    expect(mockLogActivity).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["typo", `cascade=treu`],
+    ["empty value", "cascade="],
+    ["numeric truthy value", "cascade=1"],
+    ["repeated values", "cascade=true&cascade=false"],
+  ])("rejects malformed cascade query: %s", async (_label, query) => {
+    const res = await request(await createApp(boardActor()))
+      .delete(`/api/issues/${issueId}?${query}`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(mockIssueService.remove).not.toHaveBeenCalled();
+  });
+
+  it("accepts cascade=false as leaf-only deletion", async () => {
+    const res = await request(await createApp(boardActor()))
+      .delete(`/api/issues/${issueId}`)
+      .query({ cascade: "false" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.remove).toHaveBeenCalledWith(issueId, expect.objectContaining({
+      cascade: false,
+      afterDelete: expect.any(Function),
+    }));
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {

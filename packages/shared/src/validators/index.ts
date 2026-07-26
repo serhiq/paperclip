@@ -366,6 +366,7 @@ export {
 export {
   createIssueSchema,
   createIssueInputSchema,
+  deleteIssueQuerySchema,
   createChildIssueSchema,
   createAcceptedPlanDecompositionSchema,
   resolveCreateIssueStatusDefault,

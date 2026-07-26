@@ -43,6 +43,7 @@ import {
   createDocumentAnnotationThreadSchema,
   createChildIssueSchema,
   createIssueSchema,
+  deleteIssueQuerySchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
   feedbackTargetTypeSchema,
@@ -8975,41 +8976,80 @@ export function issueRoutes(
   });
 
   router.delete("/issues/:id", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const attachments = await svc.listAttachments(id);
+    const { cascade } = deleteIssueQuerySchema.parse(req.query);
 
-    const issue = await svc.remove(id);
-    if (!issue) {
+    const actor = getActorInfo(req);
+    const deletionOperationId = randomUUID();
+    const deletion = await svc.remove(id, {
+      cascade,
+      afterDelete: async (deleted, tx) => {
+        await logActivity(tx, {
+          companyId: deleted.issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.subtree_deleted",
+          entityType: "issue",
+          entityId: deleted.issue.id,
+          details: {
+            deletionOperationId,
+            cascade,
+            ...deleted.audit,
+            storageCleanupStatus: "pending",
+            storageObjectCount: deleted.storageObjectCount,
+          },
+        });
+      },
+    });
+    if (!deletion) {
       res.status(404).json({ error: "Issue not found" });
       return;
     }
 
-    for (const attachment of attachments) {
+    let storageObjectsDeleted = 0;
+    let storageObjectsFailed = 0;
+    for (const attachment of deletion.attachments) {
       try {
         await storage.deleteObject(attachment.companyId, attachment.objectKey);
+        storageObjectsDeleted += 1;
       } catch (err) {
+        storageObjectsFailed += 1;
         logger.warn({ err, issueId: id, attachmentId: attachment.id }, "failed to delete attachment object during issue delete");
       }
     }
 
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "issue.deleted",
-      entityType: "issue",
-      entityId: issue.id,
-    });
+    try {
+      await logActivity(db, {
+        companyId: deletion.issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.subtree_storage_cleanup_completed",
+        entityType: "issue",
+        entityId: deletion.issue.id,
+        details: {
+          deletionOperationId,
+          attempted: deletion.attachments.length,
+          succeeded: storageObjectsDeleted,
+          failed: storageObjectsFailed,
+        },
+      });
+    } catch (error) {
+      logger.error(
+        { err: error, issueId: id, deletionOperationId },
+        "failed to record issue storage cleanup activity",
+      );
+    }
 
-    await queueTaskWatchdogEvaluation(existing, actor.runId);
-    res.json(issue);
+    res.json(deletion.issue);
   });
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {

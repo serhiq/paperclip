@@ -494,6 +494,12 @@ export const createIssueSchema = withCreateIssueStatusDefault(
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
+export const deleteIssueQuerySchema = z.object({
+  cascade: z.enum(["true", "false"]).optional(),
+}).strict().transform(({ cascade }) => ({
+  cascade: cascade === "true",
+}));
+
 export const upsertIssueWatchdogSchema = z.object({
   agentId: z.string().uuid(),
   instructions: multilineTextSchema.optional().nullable(),

@@ -12,6 +12,8 @@ import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
+type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+type ActivityLogDb = Pick<Db | DbTransaction, "select" | "insert" | "update">;
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
   issue_comment_added: "issue.comment.created",
   issue_comment_created: "issue.comment.created",
@@ -69,7 +71,7 @@ function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
+export async function resolveResponsibleUserIdForActivity(db: ActivityLogDb, input: LogActivityInput) {
   if (input.actorType === "user") return readNonEmptyString(input.actorId);
 
   const runId = readNonEmptyString(input.runId);
@@ -124,7 +126,7 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
   return readNonEmptyString(company?.defaultResponsibleUserId);
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
+export async function logActivity(db: ActivityLogDb, input: LogActivityInput) {
   const currentUserRedactionOptions = {
     enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
   };

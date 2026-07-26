@@ -4,9 +4,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
+  companySkills,
+  companySkillTestRuns,
+  companySkillVersions,
   createDb,
+  costEvents,
   documentRevisions,
   documents,
   environments,
@@ -17,10 +22,13 @@ import {
   issueComments,
   issueInboxArchives,
   issueDocuments,
+  issueReadStates,
   issuePlanDecompositions,
   issueRelations,
   issueThreadInteractions,
   issues,
+  feedbackVotes,
+  financeEvents,
   projectWorkspaces,
   projects,
   workspaceOperations,
@@ -289,6 +297,330 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping embedded Postgres issue service tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+describeEmbeddedPostgres("issueService.remove foreign-key actions", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-remove-fk-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(companySkillTestRuns);
+    await db.delete(companySkillVersions);
+    await db.delete(companySkills);
+    await db.delete(agentWakeupRequests);
+    await db.delete(heartbeatRuns);
+    await db.delete(feedbackVotes);
+    await db.delete(issueReadStates);
+    await db.delete(issueInboxArchives);
+    await db.delete(issueComments);
+    await db.delete(issueThreadInteractions);
+    await db.delete(financeEvents);
+    await db.delete(costEvents);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("installs the intended validated delete actions while keeping parent deletion restrictive", async () => {
+    const constraints = Array.from(
+      await db.execute(sql<{
+        conname: string;
+        deleteAction: string;
+        validated: boolean;
+      }>`
+        SELECT
+          conname,
+          confdeltype::text AS "deleteAction",
+          convalidated AS validated
+        FROM pg_constraint
+        WHERE conname IN (
+          'cost_events_issue_id_issues_id_fk',
+          'finance_events_issue_id_issues_id_fk',
+          'issue_thread_interactions_issue_id_issues_id_fk',
+          'issue_comments_issue_id_issues_id_fk',
+          'issue_read_states_issue_id_issues_id_fk',
+          'issue_inbox_archives_issue_id_issues_id_fk',
+          'feedback_votes_issue_id_issues_id_fk',
+          'issues_parent_id_issues_id_fk'
+        )
+        ORDER BY conname
+      `),
+    );
+
+    expect(constraints).toEqual([
+      { conname: "cost_events_issue_id_issues_id_fk", deleteAction: "n", validated: true },
+      { conname: "feedback_votes_issue_id_issues_id_fk", deleteAction: "c", validated: true },
+      { conname: "finance_events_issue_id_issues_id_fk", deleteAction: "n", validated: true },
+      { conname: "issue_comments_issue_id_issues_id_fk", deleteAction: "c", validated: true },
+      { conname: "issue_inbox_archives_issue_id_issues_id_fk", deleteAction: "c", validated: true },
+      { conname: "issue_read_states_issue_id_issues_id_fk", deleteAction: "c", validated: true },
+      { conname: "issue_thread_interactions_issue_id_issues_id_fk", deleteAction: "c", validated: true },
+      { conname: "issues_parent_id_issues_id_fk", deleteAction: "a", validated: true },
+    ]);
+  });
+
+  async function seedIssueTree(options: { rootStatus?: string; rootTitle?: string } = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const childIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Issue deletion test company",
+      issuePrefix: "DEL",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Deletion test agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: options.rootTitle ?? "Issue to delete",
+        status: options.rootStatus ?? "todo",
+        priority: "medium",
+      },
+      {
+        id: childIssueId,
+        companyId,
+        parentId: issueId,
+        title: "Child issue to retain",
+        status: "todo",
+        priority: "medium",
+      },
+    ]);
+    return { companyId, agentId, issueId, childIssueId };
+  }
+
+  it("rejects deleting a parent unless cascade is explicit", async () => {
+    const { issueId } = await seedIssueTree();
+
+    await expect(svc.remove(issueId)).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_has_children",
+        childCount: 1,
+      },
+    });
+
+    await expect(db.select({ id: issues.id }).from(issues)).resolves.toHaveLength(2);
+  });
+
+  it("cascades the subtree, preserves financial events, and deletes issue-owned rows", async () => {
+    const { companyId, agentId, issueId, childIssueId } = await seedIssueTree();
+
+    const occurredAt = new Date("2026-07-26T12:00:00.000Z");
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      issueId,
+      provider: "test",
+      model: "test-model",
+      costCents: 1,
+      occurredAt,
+    });
+    await db.insert(financeEvents).values({
+      companyId,
+      issueId,
+      eventKind: "test",
+      biller: "test",
+      amountCents: 1,
+      occurredAt,
+    });
+    await db.insert(issueComments).values({ companyId, issueId: childIssueId, body: "comment" });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: childIssueId,
+      kind: "request_confirmation",
+      payload: {},
+    });
+    await db.insert(issueReadStates).values({ companyId, issueId, userId: "user-1" });
+    await db.insert(issueInboxArchives).values({ companyId, issueId, userId: "user-1" });
+    await db.insert(feedbackVotes).values({
+      companyId,
+      issueId,
+      targetType: "issue",
+      targetId: issueId,
+      authorUserId: "user-1",
+      vote: "up",
+    });
+
+    const deletion = await svc.remove(issueId, { cascade: true });
+    expect(deletion).toMatchObject({
+      issue: { id: issueId },
+      audit: {
+        deletedIssueCount: 2,
+        deletedIssuesTruncated: false,
+        costEventCount: 1,
+        costCents: 1,
+        financeEventCount: 1,
+        financeAmountCents: 1,
+      },
+    });
+
+    await expect(db.select().from(issues)).resolves.toEqual([]);
+    await expect(
+      db.select({ issueId: costEvents.issueId }).from(costEvents),
+    ).resolves.toEqual([{ issueId: null }]);
+    await expect(
+      db.select({ issueId: financeEvents.issueId }).from(financeEvents),
+    ).resolves.toEqual([{ issueId: null }]);
+    await expect(db.select().from(issueComments)).resolves.toEqual([]);
+    await expect(db.select().from(issueThreadInteractions)).resolves.toEqual([]);
+    await expect(db.select().from(issueReadStates)).resolves.toEqual([]);
+    await expect(db.select().from(issueInboxArchives)).resolves.toEqual([]);
+    await expect(db.select().from(feedbackVotes)).resolves.toEqual([]);
+  });
+
+  it("rolls back the subtree deletion when the transactional audit callback fails", async () => {
+    const { issueId } = await seedIssueTree();
+
+    await expect(svc.remove(issueId, {
+      cascade: true,
+      afterDelete: async () => {
+        throw new Error("activity unavailable");
+      },
+    })).rejects.toThrow("activity unavailable");
+
+    await expect(
+      db.select({ id: issues.id }).from(issues).orderBy(asc(issues.id)),
+    ).resolves.toHaveLength(2);
+  });
+
+  it("bounds issue titles in the deletion audit snapshot", async () => {
+    const longTitle = "x".repeat(501);
+    const { issueId } = await seedIssueTree({ rootTitle: longTitle });
+
+    const deletion = await svc.remove(issueId, { cascade: true });
+
+    expect(deletion?.audit.deletedIssues).toEqual([
+      expect.objectContaining({
+        id: issueId,
+        title: "x".repeat(500),
+        titleTruncated: true,
+      }),
+      expect.objectContaining({
+        title: "Child issue to retain",
+        titleTruncated: false,
+      }),
+    ]);
+  });
+
+  it("rejects deleting an in-progress issue even when no run is linked", async () => {
+    const { issueId } = await seedIssueTree({ rootStatus: "in_progress" });
+
+    await expect(svc.remove(issueId, { cascade: true })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_delete_active_work",
+        inProgressIssueIds: [issueId],
+      },
+    });
+  });
+
+  it("recognizes unclaimed deferred wakeups through nested task context", async () => {
+    const { companyId, agentId, issueId } = await seedIssueTree();
+    const wakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "test",
+      status: "deferred_issue_execution",
+      payload: {
+        _paperclipWakeContext: {
+          taskId: issueId,
+        },
+      },
+    });
+
+    await expect(svc.remove(issueId, { cascade: true })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_delete_active_work",
+        activeWakeupRequestIds: [wakeupRequestId],
+      },
+    });
+  });
+
+  it("recognizes queued runs through task context", async () => {
+    const { companyId, agentId, issueId } = await seedIssueTree();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      contextSnapshot: { taskId: issueId },
+    });
+
+    await expect(svc.remove(issueId, { cascade: true })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_delete_active_work",
+        activeRunIds: [runId],
+      },
+    });
+  });
+
+  it("returns a structured conflict for protected skill-test history", async () => {
+    const { companyId, agentId, issueId, childIssueId } = await seedIssueTree();
+    const skillId = randomUUID();
+    const skillVersionId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: "deletion-test",
+      slug: "deletion-test",
+      name: "Deletion test",
+      markdown: "# Test",
+    });
+    await db.insert(companySkillVersions).values({
+      id: skillVersionId,
+      companyId,
+      companySkillId: skillId,
+      revisionNumber: 1,
+    });
+    await db.insert(companySkillTestRuns).values({
+      companyId,
+      skillId,
+      skillVersionId,
+      agentId,
+      issueId: childIssueId,
+      inputSnapshot: "test",
+    });
+
+    await expect(svc.remove(issueId, { cascade: true })).rejects.toMatchObject({
+      status: 409,
+      details: {
+        code: "issue_delete_protected_history",
+        resourceType: "company_skill_test_runs",
+        referenceCount: 1,
+        referencedIssueIds: [childIssueId],
+      },
+    });
+  });
+});
 
 describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   let db!: ReturnType<typeof createDb>;

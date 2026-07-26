@@ -75,7 +75,10 @@ function formatVerb(
     case "issue.attachment_removed":
       return "removed attachment from";
     case "issue.deleted":
+    case "issue.subtree_deleted":
       return "deleted";
+    case "issue.subtree_storage_cleanup_completed":
+      return "cleaned stored files for";
 
     case "approval.created":
       return context === "pinned" ? "needs approval on" : "requested approval on";

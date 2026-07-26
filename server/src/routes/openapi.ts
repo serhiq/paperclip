@@ -25,6 +25,7 @@ import {
   testAdapterEnvironmentSchema,
   // Issue
   createIssueSchema,
+  deleteIssueQuerySchema,
   updateIssueSchema,
   createIssueLabelSchema,
   addIssueCommentSchema,
@@ -1993,8 +1994,19 @@ registry.registerPath({
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Delete an issue",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  description: "Deletes a leaf issue. Set `cascade=true` to delete its full subtree.",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: deleteIssueQuerySchema,
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
 });
 
 registry.registerPath({

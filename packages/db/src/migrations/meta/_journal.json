@@ -1338,6 +1338,20 @@
       "when": 1784916886226,
       "tag": "0192_task_watchdog_stop_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 193,
+      "version": "7",
+      "when": 1785029541571,
+      "tag": "0193_issue_delete_fk_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 194,
+      "version": "7",
+      "when": 1785029541572,
+      "tag": "0194_validate_issue_delete_fk_actions",
+      "breakpoints": true
     }
   ]
 }

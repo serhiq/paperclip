@@ -1562,6 +1562,7 @@ export {
   type CompanySearchQuery,
   createIssueSchema,
   createIssueInputSchema,
+  deleteIssueQuerySchema,
   createChildIssueSchema,
   createAcceptedPlanDecompositionSchema,
   resolveCreateIssueStatusDefault,
