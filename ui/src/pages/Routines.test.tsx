@@ -299,6 +299,8 @@ function createRoutine(overrides: Partial<RoutineListItem>): RoutineListItem {
     status: "active",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
+    activityGatePolicy: "always",
+    activityGateScope: "company",
     variables: [],
     latestRevisionId: null,
     latestRevisionNumber: 1,
@@ -416,6 +418,7 @@ describe("Routines page", () => {
         ["agent-1", { name: "Agent One" }],
         ["agent-2", { name: "Agent Two" }],
       ]),
+      new Map(),
     );
 
     expect(groups.map((group) => group.label)).toEqual(["Project Alpha", "Project Beta"]);
@@ -438,6 +441,7 @@ describe("Routines page", () => {
       "project",
       new Map([["project-1", { name: "Project Alpha" }]]),
       new Map([["agent-1", { name: "Agent One" }]]),
+      new Map(),
     );
 
     expect(groups.map((group) => group.label)).toEqual(["Project Alpha", "Built-in routines"]);
@@ -445,20 +449,71 @@ describe("Routines page", () => {
     expect(groups[1]?.items.map((item) => item.title)).toEqual(["Reflection review"]);
   });
 
-  it("uses a flat group when Folder grouping is active", () => {
-    const routines = [
-      createRoutine({ id: "routine-1", title: "Morning sync", projectId: "project-1" }),
-      createRoutine({ id: "routine-2", title: "Weekly digest", projectId: "project-2" }),
-    ];
-
+  it("groups routines by folder using folder names and Unfiled labels", () => {
     const groups = buildRoutineGroups(
-      routines,
+      [
+        createRoutine({ id: "routine-1", title: "RPI review", folderId: "folder-rpi" }),
+        createRoutine({ id: "routine-2", title: "Unfiled sweep", folderId: null }),
+        createRoutine({ id: "routine-3", title: "Test summary", folderId: "folder-test" }),
+      ],
       "folder",
       new Map(),
       new Map(),
+      new Map([
+        ["folder-rpi", { name: "RPI" }],
+        ["folder-test", { name: "Test" }],
+      ]),
     );
 
-    expect(groups).toEqual([{ key: "__all", label: null, items: routines }]);
+    expect(groups.map((group) => group.label)).toEqual(["RPI", "Test", "Unfiled"]);
+    expect(groups[0]?.items.map((item) => item.title)).toEqual(["RPI review"]);
+    expect(groups[1]?.items.map((item) => item.title)).toEqual(["Test summary"]);
+    expect(groups[2]?.items.map((item) => item.title)).toEqual(["Unfiled sweep"]);
+  });
+
+  it("orders folder groups by folder position before label and keeps Unfiled after folders", () => {
+    const groups = buildRoutineGroups(
+      [
+        createRoutine({ id: "routine-1", title: "Beta routine", folderId: "folder-beta" }),
+        createRoutine({ id: "routine-2", title: "Loose routine", folderId: null }),
+        createRoutine({ id: "routine-3", title: "Alpha routine", folderId: "folder-alpha" }),
+      ],
+      "folder",
+      new Map(),
+      new Map(),
+      new Map([
+        ["folder-alpha", { name: "Alpha", position: 20 }],
+        ["folder-beta", { name: "Beta", position: 10 }],
+      ]),
+    );
+
+    expect(groups.map((group) => group.label)).toEqual(["Beta", "Alpha", "Unfiled"]);
+    expect(groups.map((group) => group.key)).toEqual(["folder-beta", "folder-alpha", "__unfiled"]);
+  });
+
+  it("keeps built-in routines in their own section after folder groups", () => {
+    const groups = buildRoutineSections(
+      [
+        createRoutine({ id: "routine-1", title: "RPI review", folderId: "folder-rpi" }),
+        createRoutine({
+          id: "routine-2",
+          title: "Reflection review",
+          folderId: "folder-rpi",
+          originKind: "built_in_agent_bundle",
+          originId: "reflection-coach:recent-agent-reflection",
+        }),
+        createRoutine({ id: "routine-3", title: "Unfiled sweep", folderId: null }),
+      ],
+      "folder",
+      new Map(),
+      new Map(),
+      new Map([["folder-rpi", { name: "RPI" }]]),
+    );
+
+    expect(groups.map((group) => group.label)).toEqual(["RPI", "Unfiled", "Built-in routines"]);
+    expect(groups[0]?.items.map((item) => item.title)).toEqual(["RPI review"]);
+    expect(groups[1]?.items.map((item) => item.title)).toEqual(["Unfiled sweep"]);
+    expect(groups[2]?.items.map((item) => item.title)).toEqual(["Reflection review"]);
   });
 
   it("sorts routines by selected field and direction without mutating the source list", () => {
@@ -552,11 +607,50 @@ describe("Routines page", () => {
     });
   });
 
-  it("defaults the routines list to folder mode without rendering project groups", async () => {
+  it("defaults the routines list to folder mode with inline folder sections", async () => {
+    foldersListMock.mockResolvedValue({
+      kind: "routine",
+      allCount: 3,
+      unfiledCount: 1,
+      folders: [
+        {
+          id: "folder-rpi",
+          companyId: "company-1",
+          kind: "routine",
+          parentId: null,
+          name: "RPI",
+          slug: "rpi",
+          systemKey: null,
+          path: "rpi",
+          depth: 1,
+          color: null,
+          position: 0,
+          itemCount: 1,
+          createdAt: new Date("2026-07-01T00:00:00.000Z"),
+          updatedAt: new Date("2026-07-01T00:00:00.000Z"),
+        },
+        {
+          id: "folder-test",
+          companyId: "company-1",
+          kind: "routine",
+          parentId: null,
+          name: "Test",
+          slug: "test",
+          systemKey: null,
+          path: "test",
+          depth: 1,
+          color: null,
+          position: 1,
+          itemCount: 1,
+          createdAt: new Date("2026-07-01T00:00:00.000Z"),
+          updatedAt: new Date("2026-07-01T00:00:00.000Z"),
+        },
+      ],
+    });
     routinesListMock.mockResolvedValue([
-      createRoutine({ id: "routine-1", title: "Weekly digest", projectId: "project-1" }),
-      createRoutine({ id: "routine-2", title: "Morning sync", projectId: "project-1" }),
-      createRoutine({ id: "routine-3", title: "Agent review", projectId: "project-2" }),
+      createRoutine({ id: "routine-1", title: "RPI review", folderId: "folder-rpi", projectId: "project-1" }),
+      createRoutine({ id: "routine-2", title: "Unfiled sweep", folderId: null, projectId: "project-1" }),
+      createRoutine({ id: "routine-3", title: "Test summary", folderId: "folder-test", projectId: "project-2" }),
     ]);
     issuesListMock.mockResolvedValue([]);
 
@@ -576,15 +670,20 @@ describe("Routines page", () => {
       await flush();
     });
 
-    for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Morning sync"); attempts += 1) {
+    for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Unfiled sweep"); attempts += 1) {
       await act(async () => {
         await flush();
       });
     }
 
+    const sectionLabels = Array.from(container.querySelectorAll("span"))
+      .filter((element) => element.className.includes("uppercase") && element.className.includes("tracking-wide"))
+      .map((element) => element.textContent);
+    expect(sectionLabels).toEqual(["RPI", "Test", "Unfiled"]);
+
     const text = container.textContent ?? "";
-    expect(text.indexOf("Morning sync")).toBeLessThan(text.indexOf("Weekly digest"));
-    expect(text).toContain("New folder");
+    expect(text.indexOf("RPI review")).toBeLessThan(text.indexOf("Test summary"));
+    expect(text.indexOf("Test summary")).toBeLessThan(text.indexOf("Unfiled sweep"));
 
     await act(async () => {
       root.unmount();
